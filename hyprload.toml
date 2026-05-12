@@ -1,0 +1,14 @@
+[repository]
+name = "hypr-session-restore"
+authors = ["wirehead"]
+version = "1.0.0"
+description = "Persist window layouts across Hyprland crashes; relaunch apps on startup."
+
+[hypr-session-restore]
+output = "hypr-session-restore.so"
+authors = ["wirehead"]
+version = "1.0.0"
+description = """Snapshot open windows on every layout change, rotate to backup,
+restore on next Hyprland start. Crash-loop guard, autostart de-duplication,
+locked snapshots during restore."""
+build = ["make all"]
