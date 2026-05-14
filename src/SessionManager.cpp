@@ -10,7 +10,10 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <unistd.h>
@@ -34,7 +37,135 @@ static std::string basename(const std::string& p) {
     return pos == std::string::npos ? p : p.substr(pos + 1);
 }
 
+static void scrub(std::string& s) {
+    if (!s.empty())
+        ::explicit_bzero(s.data(), s.size());
+    s.clear();
 }
+
+static void scrub(std::vector<std::string>& v) {
+    for (auto& s : v)
+        scrub(s);
+    v.clear();
+}
+
+struct STerminalSpec {
+    std::vector<std::string> execFlags;
+};
+
+// Meyers singletons — defer construction until first call so a hypothetical
+// OOM during the initializer is catchable by the plugin loader instead of
+// triggering std::terminate during dynamic-load static init.
+static const std::unordered_set<std::string>& shellBasenames() {
+    static const std::unordered_set<std::string> S = {
+        "bash", "zsh", "fish", "sh", "dash", "ash", "ksh", "tcsh", "csh", "nu", "elvish", "xonsh",
+    };
+    return S;
+}
+
+static const std::unordered_set<std::string>& sensitiveBasenames() {
+    static const std::unordered_set<std::string> S = {
+        "ssh",     "scp",       "sftp",      "rsync",      "gpg",       "gpg2",
+        "age",     "sudo",      "doas",      "su",         "pkexec",    "aws",
+        "gh",      "glab",      "op",        "pass",       "bw",        "secret-tool",
+        "keyring", "curl",      "wget",      "httpie",     "http",      "psql",
+        "mysql",   "mysqldump", "pg_dump",   "mongosh",    "redis-cli", "vault",
+        "kubectl", "helm",      "terraform", "tofu",       "ansible",   "ansible-vault",
+        "openssl", "keytool",   "ssh-add",   "ssh-keygen",
+    };
+    return S;
+}
+
+static const std::unordered_map<std::string, STerminalSpec>& terminalClasses() {
+    static const std::unordered_map<std::string, STerminalSpec> M = {
+        {"kitty", {{"--"}}},
+        {"foot", {{"--"}}},
+        {"alacritty", {{"-e"}}},
+        {"Alacritty", {{"-e"}}},
+        {"org.wezfurlong.wezterm", {{"start", "--"}}},
+        {"wezterm", {{"start", "--"}}},
+        {"com.mitchellh.ghostty", {{"-e"}}},
+        {"ghostty", {{"-e"}}},
+        {"xterm", {{"-e"}}},
+        {"XTerm", {{"-e"}}},
+        {"st-256color", {{"-e"}}},
+        {"st", {{"-e"}}},
+        {"URxvt", {{"-e"}}},
+    };
+    return M;
+}
+
+static std::vector<pid_t> readChildPids(pid_t pid) {
+    std::vector<pid_t> out;
+    fs::path file =
+        fs::path("/proc") / std::to_string(pid) / "task" / std::to_string(pid) / "children";
+    std::string content = readFile(file);
+    std::istringstream ss(content);
+    pid_t child = 0;
+    while (ss >> child)
+        if (child > 0)
+            out.push_back(child);
+    return out;
+}
+
+struct SProcStat {
+    pid_t ppid = 0;
+    unsigned long long starttime = 0;
+};
+
+// /proc/PID/stat parsing. `comm` (field 2) is paren-wrapped and may contain
+// arbitrary bytes including spaces and close-parens, so we anchor on the LAST
+// ')' and parse the rest space-delimited. ppid = field 4, starttime = field 22.
+static std::optional<SProcStat> readStat(pid_t pid) {
+    std::string s = readFile(fs::path("/proc") / std::to_string(pid) / "stat");
+    if (s.empty())
+        return std::nullopt;
+    auto close = s.rfind(')');
+    if (close == std::string::npos || close + 2 >= s.size())
+        return std::nullopt;
+    std::istringstream rest(s.substr(close + 2));
+    char state = 0;
+    pid_t ppid = 0;
+    if (!(rest >> state >> ppid))
+        return std::nullopt;
+    std::string skip;
+    for (int i = 0; i < 17; ++i)
+        if (!(rest >> skip))
+            return std::nullopt;
+    unsigned long long starttime = 0;
+    if (!(rest >> starttime))
+        return std::nullopt;
+    return SProcStat{ppid, starttime};
+}
+
+// Walk /proc descendant tree, picking at each step the child with the most
+// recent start-time (true "most recently spawned"; kernel does NOT order
+// /proc/PID/task/PID/children by spawn time). Children whose ppid no longer
+// matches the parent are dropped — guards against PID-reuse where /proc reads
+// races a dead-and-recycled descendant. Bounded depth to avoid loops.
+static pid_t findDeepestChild(pid_t root) {
+    pid_t cur = root;
+    for (int depth = 0; depth < 16; ++depth) {
+        auto kids = readChildPids(cur);
+        pid_t pick = 0;
+        unsigned long long bestStart = 0;
+        for (pid_t k : kids) {
+            auto st = readStat(k);
+            if (!st || st->ppid != cur)
+                continue;
+            if (pick == 0 || st->starttime > bestStart) {
+                pick = k;
+                bestStart = st->starttime;
+            }
+        }
+        if (pick == 0)
+            return cur;
+        cur = pick;
+    }
+    return cur;
+}
+
+} // namespace
 
 CSessionManager::CSessionManager(HANDLE handle) : m_handle(handle) {
     const char* home = std::getenv("HOME");
@@ -53,6 +184,44 @@ CSessionManager::~CSessionManager() {
 void CSessionManager::init() {
     m_pluginStart = steady_clock::now();
     m_lastEvent = m_pluginStart;
+    m_lastSnapshot = m_pluginStart;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    // Hyprlang::CConfigValue::getDataStaticPtr() returns void*const* and the
+    // public API instructs callers to reinterpret to the concrete type matching
+    // the registered Hyprlang::INT / Hyprlang::STRING. There is no safer cast
+    // available at this boundary.
+    auto getInt = [this](const char* name) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        return reinterpret_cast<Hyprlang::INT* const*>(
+            HyprlandAPI::getConfigValue(m_handle, name)->getDataStaticPtr());
+    };
+    auto getStr = [this](const char* name) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        return reinterpret_cast<Hyprlang::STRING* const*>(
+            HyprlandAPI::getConfigValue(m_handle, name)->getDataStaticPtr());
+    };
+    m_pcEnabled = getInt("plugin:hypr-session:enabled");
+    m_pcDebounce = getInt("plugin:hypr-session:debounce_secs");
+    m_pcPeriodic = getInt("plugin:hypr-session:periodic_secs");
+    m_pcStartupDelay = getInt("plugin:hypr-session:startup_delay_secs");
+    m_pcCrashWindow = getInt("plugin:hypr-session:crash_loop_window_secs");
+    m_pcCrashLimit = getInt("plugin:hypr-session:crash_loop_limit");
+    m_pcLaunchGapMs = getInt("plugin:hypr-session:launch_gap_ms");
+    m_pcExtraSkip = getStr("plugin:hypr-session:extra_skip");
+    m_pcExtraSensitive = getStr("plugin:hypr-session:extra_sensitive");
+#pragma GCC diagnostic pop
+    refreshConfig();
+
+    if (m_crashLoopWindowSecs <= 0)
+        m_crashLoopWindowSecs = 180;
+    if (m_crashLoopLimit <= 0)
+        m_crashLoopLimit = 3;
+    if (m_debounceSecs <= 0)
+        m_debounceSecs = 3;
+    if (m_periodicSnapshotSecs <= 0)
+        m_periodicSnapshotSecs = 30;
 
     auto& B = Event::bus();
     std::function<void()> evt = [this] { onWindowEvent(); };
@@ -77,7 +246,58 @@ void CSessionManager::onWindowEvent() {
     m_lastEvent = steady_clock::now();
 }
 
+void CSessionManager::refreshConfig() {
+    if (m_pcEnabled && *m_pcEnabled)
+        m_enabled = **m_pcEnabled != 0;
+    if (m_pcDebounce && *m_pcDebounce && **m_pcDebounce > 0)
+        m_debounceSecs = static_cast<int>(**m_pcDebounce);
+    if (m_pcPeriodic && *m_pcPeriodic && **m_pcPeriodic > 0)
+        m_periodicSnapshotSecs = static_cast<int>(**m_pcPeriodic);
+    if (m_pcStartupDelay && *m_pcStartupDelay && **m_pcStartupDelay >= 0)
+        m_startupDelaySecs = static_cast<int>(**m_pcStartupDelay);
+    if (m_pcCrashWindow && *m_pcCrashWindow && **m_pcCrashWindow > 0)
+        m_crashLoopWindowSecs = static_cast<int>(**m_pcCrashWindow);
+    if (m_pcCrashLimit && *m_pcCrashLimit && **m_pcCrashLimit > 0)
+        m_crashLoopLimit = static_cast<int>(**m_pcCrashLimit);
+    if (m_pcLaunchGapMs && *m_pcLaunchGapMs && **m_pcLaunchGapMs >= 0)
+        m_launchGapSecs = static_cast<double>(**m_pcLaunchGapMs) / 1000.0;
+
+    auto refreshSet = [](Hyprlang::STRING* const* p, Hyprlang::STRING& ptrCache,
+                         std::string& strCache, std::unordered_set<std::string>& out) {
+        if (!p || !*p || !**p)
+            return;
+        Hyprlang::STRING cur = **p;
+        if (cur == ptrCache)
+            return;
+        ptrCache = cur;
+        std::string s = cur ? cur : "";
+        if (s == strCache)
+            return;
+        strCache = std::move(s);
+        out.clear();
+        std::string tok;
+        for (char c : strCache) {
+            if (c == ',' || c == ' ' || c == '\t' || c == '\n') {
+                if (!tok.empty()) {
+                    out.insert(tok);
+                    tok.clear();
+                }
+            } else
+                tok.push_back(c);
+        }
+        if (!tok.empty())
+            out.insert(std::move(tok));
+    };
+    refreshSet(m_pcExtraSkip, m_lastExtraSkipPtr, m_lastExtraSkip, m_extraSkipBasenames);
+    refreshSet(m_pcExtraSensitive, m_lastExtraSensitivePtr, m_lastExtraSensitive,
+               m_extraSensitiveBasenames);
+}
+
 void CSessionManager::onTick() {
+    refreshConfig();
+    if (!m_enabled)
+        return;
+
     auto now = steady_clock::now();
 
     if (!m_restoreAttempted && now - m_pluginStart >= seconds(m_startupDelaySecs)) {
@@ -92,10 +312,14 @@ void CSessionManager::onTick() {
         return;
     }
 
-    if (m_dirty && now - m_lastEvent >= seconds(m_debounceSecs) && !restoreLockExists()) {
+    bool debouncedDirty = m_dirty && now - m_lastEvent >= seconds(m_debounceSecs);
+    bool periodicDue = now - m_lastSnapshot >= seconds(m_periodicSnapshotSecs);
+
+    if ((debouncedDirty || periodicDue) && !restoreLockExists()) {
         m_dirty = false;
         try {
             snapshotNow();
+            m_lastSnapshot = now;
         } catch (const std::exception& e) {
             Log::logger->log(Log::ERR, "[hypr-session] snapshot threw: {}", e.what());
         }
@@ -136,6 +360,9 @@ std::vector<SWindowSnapshot> CSessionManager::collectWindows() const {
     std::vector<SWindowSnapshot> out;
     std::unordered_set<pid_t> seen;
 
+    if (!g_pCompositor)
+        return out;
+
     for (const auto& w : g_pCompositor->m_windows) {
         if (!w || w->m_fadingOut || w->isHidden())
             continue;
@@ -150,17 +377,63 @@ std::vector<SWindowSnapshot> CSessionManager::collectWindows() const {
             continue;
 
         std::string base = basename(argv[0]);
-        if (m_skipBasenames.count(base))
+        if (m_skipBasenames.count(base) || m_extraSkipBasenames.count(base)) {
+            scrub(argv);
+            scrub(cwd);
             continue;
+        }
 
         auto ws = w->m_workspace;
-        if (!ws)
+        if (!ws) {
+            scrub(argv);
+            scrub(cwd);
             continue;
+        }
         int wsId = static_cast<int>(ws->m_id);
-        if (wsId < 0)
+        if (wsId < 0) {
+            scrub(argv);
+            scrub(cwd);
             continue;
+        }
 
         seen.insert(pid);
+
+        // Terminal foreground capture: if the window is a known terminal,
+        // walk the process tree to the deepest descendant and (only if it's
+        // not a shell or a sensitive-arg program) record `<terminal> <flag> <argv0>`
+        // with the child's cwd. We deliberately drop ALL args of the foreground
+        // program — argv often carries secrets (tokens, passwords, hosts), and
+        // this snapshot lands on disk where backups can scrape it.
+        const auto& terms = terminalClasses();
+        if (auto termIt = terms.find(w->m_class); termIt != terms.end()) {
+            pid_t deepPid = findDeepestChild(pid);
+            if (deepPid != pid) {
+                std::vector<std::string> childArgv;
+                std::string childCwd;
+                if (readProc(deepPid, childArgv, childCwd) && !childArgv.empty()) {
+                    std::string childBase = basename(childArgv[0]);
+                    if (!shellBasenames().count(childBase) &&
+                        !sensitiveBasenames().count(childBase) &&
+                        !m_extraSensitiveBasenames.count(childBase) && !childBase.empty() &&
+                        childBase[0] != '-') {
+                        std::vector<std::string> wrapped;
+                        wrapped.reserve(2 + termIt->second.execFlags.size());
+                        wrapped.push_back(base);
+                        for (const auto& f : termIt->second.execFlags)
+                            wrapped.push_back(f);
+                        wrapped.push_back(childBase);
+                        scrub(argv);
+                        argv = std::move(wrapped);
+                        if (!childCwd.empty()) {
+                            scrub(cwd);
+                            cwd = std::move(childCwd);
+                        }
+                    }
+                    scrub(childArgv);
+                    scrub(childCwd);
+                }
+            }
+        }
 
         SWindowSnapshot s;
         s.cmdline = std::move(argv);
@@ -172,6 +445,8 @@ std::vector<SWindowSnapshot> CSessionManager::collectWindows() const {
         s.floating = w->m_isFloating;
         s.fullscreen = w->isFullscreen();
 
+        if (!w->m_realPosition || !w->m_realSize)
+            continue;
         auto pos = w->m_realPosition->value();
         auto size = w->m_realSize->value();
         s.atX = pos.x;
@@ -213,6 +488,15 @@ void CSessionManager::writeSnapshot(const std::vector<SWindowSnapshot>& windows)
         obj["size"] = std::move(sz);
         winArr.emplace_back(std::move(obj));
     }
+
+    // Fingerprint the windows array (without `ts`) and skip the write if it
+    // matches the last successful write. This stops the periodic snapshot
+    // from rotating session.json -> .1 every 30s during idle.
+    std::string winsJson = serialize(Value(winArr), 2);
+    if (winsJson == m_lastWrittenJson) {
+        return;
+    }
+
     Object root;
     root["schema_version"] = HSR_SNAPSHOT_SCHEMA_VERSION;
     root["ts"] =
@@ -227,10 +511,18 @@ void CSessionManager::writeSnapshot(const std::vector<SWindowSnapshot>& windows)
     if (isSecureRegularFile(m_sessionFile)) {
         std::error_code ec;
         fs::rename(m_sessionFile, m_backupFile, ec);
-        static_cast<void>(::chmod(m_backupFile.c_str(), HSR_SECURE_FILE_MODE));
+        if (ec) {
+            Log::logger->log(Log::WARN, "[hypr-session] backup rename failed: {}", ec.message());
+        } else if (::chmod(m_backupFile.c_str(), HSR_SECURE_FILE_MODE) != 0) {
+            Log::logger->log(Log::WARN, "[hypr-session] chmod on backup failed: {}",
+                             std::strerror(errno));
+        }
     }
-    if (!writeFileAtomic(m_sessionFile, serialize(Value(std::move(root)), 2)))
+    if (!writeFileAtomic(m_sessionFile, serialize(Value(std::move(root)), 2))) {
         Log::logger->log(Log::ERR, "[hypr-session] failed to write {}", m_sessionFile.string());
+        return;
+    }
+    m_lastWrittenJson = std::move(winsJson);
 }
 
 void CSessionManager::snapshotNow() {
@@ -326,6 +618,9 @@ bool CSessionManager::restoreLockExists() const {
     auto age = fs::file_time_type::clock::now() - st;
     if (age > seconds(m_restoreLockMaxAgeSecs)) {
         fs::remove(m_restoreLock, ec);
+        if (ec)
+            Log::logger->log(Log::WARN, "[hypr-session] stale lock remove failed: {}",
+                             ec.message());
         return false;
     }
     return true;
@@ -338,9 +633,16 @@ void CSessionManager::touchRestoreLock() const {
     static_cast<void>(writeFileAtomic(m_restoreLock, ""));
 }
 
-void CSessionManager::removeRestoreLock() const {
+void CSessionManager::removeRestoreLock() const noexcept {
     std::error_code ec;
     fs::remove(m_restoreLock, ec);
+    if (!ec)
+        return;
+    try {
+        Log::logger->log(Log::WARN, "[hypr-session] lock remove failed: {}", ec.message());
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // dtor path: logger formatting may throw bad_alloc; nothing we can do.
+    }
 }
 
 bool CSessionManager::crashLoopTripped() {
@@ -364,7 +666,7 @@ bool CSessionManager::crashLoopTripped() {
                                  [&](int64_t t) { return nowSec - t >= m_crashLoopWindowSecs; }),
                   history.end());
 
-    bool tripped = static_cast<int>(history.size()) >= m_crashLoopLimit;
+    bool tripped = m_crashLoopLimit > 0 && history.size() >= static_cast<size_t>(m_crashLoopLimit);
     history.push_back(nowSec);
     if (history.size() > 20)
         history.erase(history.begin(), history.end() - 20);
@@ -383,6 +685,8 @@ bool CSessionManager::crashLoopTripped() {
 
 std::unordered_map<std::string, int> CSessionManager::currentClassCounts() const {
     std::unordered_map<std::string, int> m;
+    if (!g_pCompositor)
+        return m;
     for (const auto& w : g_pCompositor->m_windows) {
         if (!w || w->m_fadingOut || w->isHidden())
             continue;
@@ -473,6 +777,11 @@ void CSessionManager::restoreNow() {
 
     for (const auto& w : windows) {
         dispatchExec(w);
-        usleep(static_cast<useconds_t>(m_launchGapSecs * 1'000'000.0));
+        double gap = std::clamp(m_launchGapSecs, 0.0, 60.0);
+        struct timespec ts{};
+        ts.tv_sec = static_cast<time_t>(gap);
+        ts.tv_nsec = static_cast<long>((gap - static_cast<double>(ts.tv_sec)) * 1e9);
+        while (::nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+        }
     }
 }

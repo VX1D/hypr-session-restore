@@ -3,6 +3,7 @@
 #include "Snapshot.hpp"
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprlang.hpp>
 #include <hyprutils/signal/Listener.hpp>
 
 #include <chrono>
@@ -41,7 +42,7 @@ class CSessionManager {
 
     bool restoreLockExists() const;
     void touchRestoreLock() const;
-    void removeRestoreLock() const;
+    void removeRestoreLock() const noexcept;
     bool crashLoopTripped();
     std::unordered_map<std::string, int> currentClassCounts() const;
     std::vector<SWindowSnapshot>
@@ -62,14 +63,36 @@ class CSessionManager {
     bool m_dirty = false;
     std::chrono::steady_clock::time_point m_lastEvent;
     std::chrono::steady_clock::time_point m_pluginStart;
+    std::chrono::steady_clock::time_point m_lastSnapshot;
     bool m_restoreAttempted = false;
 
     int m_debounceSecs = 3;
+    int m_periodicSnapshotSecs = 30;
     int m_crashLoopWindowSecs = 180;
     int m_crashLoopLimit = 3;
     int m_restoreLockMaxAgeSecs = 90;
     int m_startupDelaySecs = 5;
     double m_launchGapSecs = 0.4;
+    bool m_enabled = true;
+
+    void refreshConfig();
+    Hyprlang::INT* const* m_pcEnabled = nullptr;
+    Hyprlang::INT* const* m_pcDebounce = nullptr;
+    Hyprlang::INT* const* m_pcPeriodic = nullptr;
+    Hyprlang::INT* const* m_pcStartupDelay = nullptr;
+    Hyprlang::INT* const* m_pcCrashWindow = nullptr;
+    Hyprlang::INT* const* m_pcCrashLimit = nullptr;
+    Hyprlang::INT* const* m_pcLaunchGapMs = nullptr;
+    Hyprlang::STRING* const* m_pcExtraSkip = nullptr;
+    Hyprlang::STRING* const* m_pcExtraSensitive = nullptr;
+    std::string m_lastExtraSkip;
+    std::string m_lastExtraSensitive;
+    std::unordered_set<std::string> m_extraSkipBasenames;
+    std::unordered_set<std::string> m_extraSensitiveBasenames;
+    Hyprlang::STRING m_lastExtraSkipPtr = nullptr;
+    Hyprlang::STRING m_lastExtraSensitivePtr = nullptr;
+
+    std::string m_lastWrittenJson;
 
     std::unordered_set<std::string> m_skipBasenames = {
         "waybar",

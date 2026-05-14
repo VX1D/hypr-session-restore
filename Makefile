@@ -20,7 +20,7 @@ $(PLUGIN_NAME).so: $(SOURCE_FILES)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SOURCE_FILES)
 
 clean:
-	$(RM) $(PLUGIN_NAME).so tests/test_json
+	$(RM) $(PLUGIN_NAME).so $(TEST_BINS)
 
 check: $(PLUGIN_NAME).so test tidy format-check
 	readelf -lW $(PLUGIN_NAME).so | grep -q 'GNU_STACK.*RW '
@@ -35,11 +35,17 @@ tidy-strict:
 format-check:
 	clang-format --dry-run --Werror src/*.cpp src/*.hpp tests/*.cpp
 
-test: tests/test_json
+TEST_BINS = tests/test_json tests/test_edge_cases
+
+test: $(TEST_BINS)
 	./tests/test_json
+	./tests/test_edge_cases
 
 tests/test_json: tests/test_json.cpp src/Json.hpp src/Snapshot.hpp src/SecureFile.hpp
 	$(CXX) -std=c++26 -Wall -Wextra -Wpedantic -Werror -I. -o $@ tests/test_json.cpp
+
+tests/test_edge_cases: tests/test_edge_cases.cpp src/Json.hpp src/Snapshot.hpp src/SecureFile.hpp
+	$(CXX) -std=c++26 -Wall -Wextra -Wpedantic -Werror -I. -o $@ tests/test_edge_cases.cpp
 
 install: $(PLUGIN_NAME).so
 	install -Dm755 $(PLUGIN_NAME).so \

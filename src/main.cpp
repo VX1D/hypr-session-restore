@@ -26,8 +26,37 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("hyprland version mismatch");
     }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:enabled", Hyprlang::INT{1});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:debounce_secs", Hyprlang::INT{3});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:periodic_secs", Hyprlang::INT{30});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:startup_delay_secs",
+                                Hyprlang::INT{5});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:crash_loop_window_secs",
+                                Hyprlang::INT{180});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:crash_loop_limit", Hyprlang::INT{3});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:launch_gap_ms", Hyprlang::INT{400});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:extra_skip", Hyprlang::STRING{""});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hypr-session:extra_sensitive",
+                                Hyprlang::STRING{""});
+#pragma GCC diagnostic pop
+
     g_pSession = std::make_unique<CSessionManager>(handle);
-    g_pSession->init();
+    try {
+        g_pSession->init();
+    } catch (const std::exception& e) {
+        g_pSession.reset();
+        HyprlandAPI::addNotification(PHANDLE,
+                                     std::string("[hypr-session-restore] init failed: ") + e.what(),
+                                     CHyprColor{1.0f, 0.4f, 0.2f, 1.0f}, 8000);
+        return {"hypr-session-restore", "init failed — plugin disabled", "wirehead", "1.0.0"};
+    } catch (...) {
+        g_pSession.reset();
+        HyprlandAPI::addNotification(PHANDLE, "[hypr-session-restore] init failed (unknown)",
+                                     CHyprColor{1.0f, 0.4f, 0.2f, 1.0f}, 8000);
+        return {"hypr-session-restore", "init failed — plugin disabled", "wirehead", "1.0.0"};
+    }
 
     HyprlandAPI::addNotification(PHANDLE, "[hypr-session-restore] loaded",
                                  CHyprColor{0.2f, 1.0f, 0.2f, 1.0f}, 4000);

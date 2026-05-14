@@ -497,4 +497,4 @@ inline std::optional<Value> parse(std::string_view src) {
     return Parser(src).parse();
 }
 
-}
+} // namespace hsrjson

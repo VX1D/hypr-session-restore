@@ -1,3 +1,5 @@
 *.so
 *.o
 tests/test_json
+tests/test_edge_cases
+tests/restore_dryrun

@@ -187,7 +187,7 @@ int runTests() {
     return 0;
 }
 
-}
+} // namespace
 
 int main() {
     return runTests();

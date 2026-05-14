@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <optional>
@@ -116,16 +117,20 @@ inline std::optional<std::string> readSecureFile(const std::filesystem::path& pa
             if (errno == EINTR) {
                 continue;
             }
+            ::explicit_bzero(buffer.data(), buffer.size());
             return std::nullopt;
         }
         if (count == 0) {
             break;
         }
         if (content.size() + static_cast<size_t>(count) > HSR_MAX_SNAPSHOT_BYTES) {
+            ::explicit_bzero(buffer.data(), buffer.size());
+            ::explicit_bzero(content.data(), content.size());
             return std::nullopt;
         }
         content.append(buffer.data(), static_cast<size_t>(count));
     }
+    ::explicit_bzero(buffer.data(), buffer.size());
     return content;
 }
 
@@ -157,6 +162,7 @@ inline bool writeFileAtomic(const std::filesystem::path& target, std::string_vie
         cursor += written;
         remaining -= static_cast<size_t>(written);
     }
+    static_cast<void>(::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_DONTNEED));
     if (::fsync(fd.get()) != 0) {
         ::unlink(tmp.c_str());
         return false;

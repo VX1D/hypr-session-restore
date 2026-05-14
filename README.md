@@ -23,6 +23,35 @@ Special workspaces (id < 0) excluded. Skip-list of autostart apps
 (waybar, hyprpaper, hypridle, mako, polkit agents, etc.) hardcoded in
 `SessionManager.hpp`.
 
+For terminal windows (`kitty`, `foot`, `alacritty`, `wezterm`, `ghostty`,
+`xterm`, `st`), the plugin walks the descendant process tree and records the
+foreground program name as `[<terminal>, <-e or -->, <argv0>]`. **Only argv[0]
+is captured — all arguments are dropped.** Programs whose argv commonly carries
+secrets (`ssh`, `gpg`, `aws`, `gh`, `op`, `pass`, `curl`, `psql`, `kubectl`,
+`vault`, `terraform`, `sudo`, etc. — see `SENSITIVE_BASENAMES` in
+`SessionManager.cpp`) are not captured at all; the terminal restores empty.
+Idle terminals (running only a shell) restore as the bare terminal.
+
+Periodic re-snapshot every 30s catches foreground-program changes that don't
+fire any Hyprland window event (e.g. you launched a terminal with an explicit
+program; the program forks too late for the debounced post-open snapshot).
+
+## Security notes
+
+- File mode `0600`, cache dir `0700`, owner-only. Open via `O_NOFOLLOW`,
+  refuses non-regular or non-owner-owned files.
+- Captured data persists on disk — exclude `~/.cache/hypr/` from any backup
+  tool (restic/borg/rclone/etc.) before adding one.
+- `/proc/<pid>/cmdline` is world-readable already; the plugin's only added
+  exposure is **persistence**. Shell scrub (`explicit_bzero`) is applied to
+  intermediate cmdline buffers; `posix_fadvise(DONTNEED)` is hinted on the
+  written file. Argv minimization (drop everything past argv[0]) is the actual
+  load-bearing mitigation.
+- Encryption-at-rest is **not** implemented: any keyring-backed key would
+  either race the 5s startup window or fail-open silently, and a key-on-disk
+  scheme is theatre. The defensible posture is "do not write secrets to disk
+  in the first place" — hence the SENSITIVE_BASENAMES denylist + argv stripping.
+
 ## Build
 
 ```
