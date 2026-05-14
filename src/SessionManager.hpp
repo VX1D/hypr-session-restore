@@ -89,8 +89,6 @@ class CSessionManager {
     std::string m_lastExtraSensitive;
     std::unordered_set<std::string> m_extraSkipBasenames;
     std::unordered_set<std::string> m_extraSensitiveBasenames;
-    Hyprlang::STRING m_lastExtraSkipPtr = nullptr;
-    Hyprlang::STRING m_lastExtraSensitivePtr = nullptr;
 
     std::string m_lastWrittenJson;
 

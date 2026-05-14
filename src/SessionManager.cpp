@@ -262,14 +262,11 @@ void CSessionManager::refreshConfig() {
     if (m_pcLaunchGapMs && *m_pcLaunchGapMs && **m_pcLaunchGapMs >= 0)
         m_launchGapSecs = static_cast<double>(**m_pcLaunchGapMs) / 1000.0;
 
-    auto refreshSet = [](Hyprlang::STRING* const* p, Hyprlang::STRING& ptrCache,
-                         std::string& strCache, std::unordered_set<std::string>& out) {
-        if (!p || !*p || !**p)
+    auto refreshSet = [](Hyprlang::STRING* const* p, std::string& strCache,
+                         std::unordered_set<std::string>& out) {
+        if (!p || !*p)
             return;
         Hyprlang::STRING cur = **p;
-        if (cur == ptrCache)
-            return;
-        ptrCache = cur;
         std::string s = cur ? cur : "";
         if (s == strCache)
             return;
@@ -288,9 +285,8 @@ void CSessionManager::refreshConfig() {
         if (!tok.empty())
             out.insert(std::move(tok));
     };
-    refreshSet(m_pcExtraSkip, m_lastExtraSkipPtr, m_lastExtraSkip, m_extraSkipBasenames);
-    refreshSet(m_pcExtraSensitive, m_lastExtraSensitivePtr, m_lastExtraSensitive,
-               m_extraSensitiveBasenames);
+    refreshSet(m_pcExtraSkip, m_lastExtraSkip, m_extraSkipBasenames);
+    refreshSet(m_pcExtraSensitive, m_lastExtraSensitive, m_extraSensitiveBasenames);
 }
 
 void CSessionManager::onTick() {
